@@ -6,6 +6,11 @@ export type UploadedImage = {
   dataUrl?: string;
 };
 
+export type ContextMessage = {
+  role?: "user" | "assistant";
+  text?: string;
+};
+
 export type ImageResult = {
   b64_json: string;
   mimeType: string;
@@ -21,6 +26,8 @@ export type ResponseData = {
 type ChatBodyInput = {
   prompt?: string;
   images?: UploadedImage[];
+  history?: ContextMessage[];
+  contextImages?: UploadedImage[];
   previousResponseId?: string;
   reasoningModel?: string;
   imageModel?: string;
@@ -77,21 +84,35 @@ export function openAIUrl(baseUrl: unknown, endpoint: string) {
 
 export function makeConversationPrompt({
   prompt,
+  history = [],
+  contextImages = [],
   outputFormat,
   forceImage
 }: {
   prompt?: string;
+  history?: ContextMessage[];
+  contextImages?: UploadedImage[];
   outputFormat: string;
   forceImage?: boolean;
 }) {
+  const transcript = history
+    .filter((message) => message?.text?.trim())
+    .map((message) => `${message.role === "assistant" ? "AI" : "用户"}：${message.text!.trim()}`)
+    .join("\n");
+
   return [
     "你是一个通用 Image2 图像对话助手。",
     "根据用户的文字和上传图片完成图像生成、编辑、重绘、风格转换、标注或分析。",
     "多轮对话中要优先保留用户已经确认的主体、构图、风格和修改要求。",
+    "回答普通问题时也必须参考下方历史对话，支持用户基于前文继续追问。",
     `用户希望输出图片格式：${outputFormat === "jpeg" ? "JPG/JPEG" : "PNG"}。`,
     "如果上传图片细节不清晰，请明确说明不确定处，不要编造精确内容。",
     "如果需要生成图片，请直接调用图像生成工具；如果需要解释或分析，也给出简洁文字。",
     forceImage ? "本轮来自“单次 Image2”按钮：必须调用图像生成工具生成或编辑图片，并把上一轮生成结果作为可延续的上下文。" : "",
+    transcript ? `以下是最近的对话上下文，请在本轮回答中延续它：\n${transcript}` : "",
+    contextImages.length
+      ? `本轮还附带了 ${contextImages.length} 张最近对话中的图片作为视觉上下文；如果用户说“这张图”“继续修改”“刚才那张”，优先指这些上下文图片。`
+      : "",
     `用户本轮要求：${prompt || "请根据上传图片和上下文生成或修改图片。"}`
   ].filter(Boolean).join("\n");
 }
@@ -117,6 +138,14 @@ export function extractResponseData(responseJson: Record<string, unknown>, prefe
 
     if (nodeType === "output_text" && typeof node.text === "string") {
       texts.push(node.text);
+    }
+
+    if (nodeType === "text" && typeof node.text === "string") {
+      texts.push(node.text);
+    }
+
+    if (typeof node.content === "string") {
+      texts.push(node.content);
     }
 
     if (
@@ -158,6 +187,8 @@ export function extractResponseData(responseJson: Record<string, unknown>, prefe
 export function buildResponsesBody({
   prompt,
   images = [],
+  history = [],
+  contextImages = [],
   previousResponseId,
   reasoningModel = "gpt-5.5",
   imageModel = "gpt-image-2",
@@ -169,9 +200,18 @@ export function buildResponsesBody({
   const content: Array<Record<string, string>> = [
     {
       type: "input_text",
-      text: makeConversationPrompt({ prompt, outputFormat, forceImage })
+      text: makeConversationPrompt({ prompt, history, contextImages, outputFormat, forceImage })
     }
   ];
+
+  for (const image of contextImages.slice(-4)) {
+    if (image?.dataUrl) {
+      content.push({
+        type: "input_image",
+        image_url: image.dataUrl
+      });
+    }
+  }
 
   for (const image of images.slice(0, 8)) {
     if (image?.dataUrl) {

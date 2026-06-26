@@ -1,6 +1,7 @@
 import type { NextFunction, Request, Response, Router } from "express";
 import express from "express";
 import {
+  type ContextMessage,
   HttpError,
   buildResponsesBody,
   callOpenAI,
@@ -18,6 +19,8 @@ type ChatRequestBody = {
   baseUrl?: string;
   prompt?: string;
   images?: UploadedImage[];
+  history?: ContextMessage[];
+  contextImages?: UploadedImage[];
   previousResponseId?: string;
   reasoningModel?: string;
   imageModel?: string;

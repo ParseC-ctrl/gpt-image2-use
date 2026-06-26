@@ -6,6 +6,7 @@ import { SettingsPanel } from "./components/SettingsPanel";
 import { createId } from "./lib/images";
 import { getStoredValue, removeStoredValue, setStoredValue } from "./lib/storage";
 import type {
+  ChatContextMessage,
   ChatMessage,
   ChatPayload,
   GeneratedImage,
@@ -50,11 +51,24 @@ export default function App() {
   const [lightbox, setLightbox] = useState<LightboxImage | null>(null);
   const progressTimerRef = useRef<number | null>(null);
   const serverConversationReadyRef = useRef(false);
+  const lastSavedPayloadRef = useRef("");
 
-  const contextText = useMemo(
-    () => (previousResponseId ? `上下文已连接：${previousResponseId}` : "尚未建立上下文"),
-    [previousResponseId]
+  const persistablePayload = useMemo(
+    () =>
+      JSON.stringify({
+        messages: messages.map(sanitizeMessageForStorage),
+        previousResponseId
+      }),
+    [messages, previousResponseId]
   );
+
+  const contextSummary = useMemo(() => buildContextSummary(messages), [messages]);
+  const contextText = useMemo(() => {
+    const responseText = previousResponseId ? "，并已连接模型响应链" : "";
+    return contextSummary.total
+      ? `上下文：最近 ${contextSummary.textMessages} 条对话、${contextSummary.images} 张图片${responseText}`
+      : "尚未建立上下文";
+  }, [contextSummary, previousResponseId]);
 
   useEffect(() => {
     Object.entries(settings).forEach(([key, value]) => setStoredValue(key, String(value)));
@@ -77,6 +91,13 @@ export default function App() {
         if (conversation.previousResponseId) {
           setStoredValue("previousResponseId", conversation.previousResponseId);
         }
+
+        lastSavedPayloadRef.current = JSON.stringify({
+          messages: (conversation.messages?.length ? conversation.messages : [welcomeMessage]).map(
+            sanitizeMessageForStorage
+          ),
+          previousResponseId: conversation.previousResponseId || ""
+        });
       } catch {
         // Local chat still works if server-side history cannot be restored.
       } finally {
@@ -92,27 +113,28 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!serverConversationReadyRef.current) return;
+    if (!serverConversationReadyRef.current || busy) return;
+    if (persistablePayload === lastSavedPayloadRef.current) return;
 
     const timer = window.setTimeout(async () => {
+      if (persistablePayload === lastSavedPayloadRef.current) return;
+
       try {
         const response = await fetch("/api/conversation", {
           method: "PUT",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            messages: messages.map(sanitizeMessageForStorage),
-            previousResponseId
-          })
+          body: persistablePayload
         });
         if (!response.ok) throw new Error("保存失败");
         await response.json();
+        lastSavedPayloadRef.current = persistablePayload;
       } catch {
         // Keep the interface quiet; the current session remains usable.
       }
     }, 650);
 
     return () => window.clearTimeout(timer);
-  }, [messages, previousResponseId]);
+  }, [persistablePayload, busy]);
 
   useEffect(() => {
     return () => stopProgressTimer();
@@ -134,21 +156,29 @@ export default function App() {
   function clearContext() {
     setPreviousResponseId("");
     removeStoredValue("previousResponseId");
-    void fetch("/api/conversation", { method: "DELETE" }).catch(() => undefined);
-    setMessages([
+    const nextMessages: ChatMessage[] = [
       {
         id: createId("assistant"),
         role: "assistant",
         text: "上下文已清空。你可以上传图片或直接输入新的生成需求。"
       }
-    ]);
+    ];
+    lastSavedPayloadRef.current = JSON.stringify({
+      messages: nextMessages.map(sanitizeMessageForStorage),
+      previousResponseId: ""
+    });
+    void fetch("/api/conversation", { method: "DELETE" }).catch(() => undefined);
+    setMessages(nextMessages);
   }
 
   function getPayload(): ChatPayload {
+    const context = buildConversationContext(messages);
     return {
       ...settings,
       prompt: prompt.trim(),
       images: attachments.map((image) => ({ ...image })),
+      history: context.history,
+      contextImages: context.contextImages,
       previousResponseId
     };
   }
@@ -156,7 +186,9 @@ export default function App() {
   function clonePayload(payload: ChatPayload): ChatPayload {
     return {
       ...payload,
-      images: payload.images.map((image) => ({ ...image }))
+      images: payload.images.map((image) => ({ ...image })),
+      history: payload.history.map((message) => ({ ...message })),
+      contextImages: payload.contextImages.map((image) => ({ ...image }))
     };
   }
 
@@ -185,6 +217,8 @@ export default function App() {
       return;
     }
 
+    setBusy(true);
+
     if (options.appendUser !== false) {
       appendMessage({
         id: createId("user"),
@@ -209,7 +243,6 @@ export default function App() {
       isGeneratingImage: directImage
     });
 
-    setBusy(true);
     startProgressTimer(assistantId);
 
     try {
@@ -425,6 +458,56 @@ function restoreStoredMessage(message: ChatMessage): ChatMessage {
     previewImage: undefined,
     isGeneratingImage: false
   };
+}
+
+function buildConversationContext(messages: ChatMessage[]) {
+  const history: ChatContextMessage[] = messages
+    .filter((message) => message.id !== "welcome" && !message.error && message.text.trim())
+    .slice(-16)
+    .map((message) => ({
+      role: message.role,
+      text: compactText(message.text, 1200)
+    }));
+
+  const contextImages = messages
+    .flatMap((message) => getContextImagesFromMessage(message))
+    .slice(-4);
+
+  return { history, contextImages };
+}
+
+function buildContextSummary(messages: ChatMessage[]) {
+  const context = buildConversationContext(messages);
+  return {
+    total: context.history.length + context.contextImages.length,
+    textMessages: context.history.length,
+    images: context.contextImages.length
+  };
+}
+
+function getContextImagesFromMessage(message: ChatMessage): UploadedImage[];
+function getContextImagesFromMessage(message: ChatMessage): UploadedImage[] {
+  if (message.error) return [];
+
+  const uploaded = (message.attachments || []).map((image) => ({
+    ...image,
+    name: `历史上传-${image.name || image.id}`
+  }));
+
+  const generated = (message.images || []).map((image, index) => ({
+    id: image.id || createId("context-image"),
+    name: `历史生成-${image.name || `${index + 1}.${image.mimeType.includes("jpeg") ? "jpg" : "png"}`}`,
+    type: image.mimeType,
+    dataUrl: `data:${image.mimeType};base64,${image.b64_json}`
+  }));
+
+  return [...uploaded, ...generated].filter((image) => image.dataUrl);
+}
+
+function compactText(text: string, maxLength: number) {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, maxLength)}...`;
 }
 
 function elapsedMs(startedAt: number) {

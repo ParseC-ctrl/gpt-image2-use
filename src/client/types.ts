@@ -43,8 +43,15 @@ export type Settings = {
 export type ChatPayload = Settings & {
   prompt: string;
   images: UploadedImage[];
+  history: ChatContextMessage[];
+  contextImages: UploadedImage[];
   previousResponseId: string;
   forceImage?: boolean;
+};
+
+export type ChatContextMessage = {
+  role: ChatRole;
+  text: string;
 };
 
 export type RetryRequest = {
